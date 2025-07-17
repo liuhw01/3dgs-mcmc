@@ -20,6 +20,8 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
+## 加
 from utils.reloc_utils import compute_relocation_cuda
 
 class GaussianModel:
@@ -146,6 +148,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # 没有 self._exposure self.exposure_mapping，曝光参数
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -408,6 +411,12 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    #作用：
+        # 重置优化器的动量统计（如 Adam 的exp_avg和exp_avg_sq），
+        # 确保重定位后的高斯参数能被正确优化。这是 MCMC 框架的关键 —— 新位置的参数需要 “忘记” 旧的优化历史。
+    # 何时调用：
+        # 在高斯重定位（relocate_gs）或新增高斯（add_new_gs）后调用，
+        # 避免旧的优化统计影响新位置的学习。
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
             "f_dc": self._features_dc,
@@ -446,13 +455,18 @@ class GaussianModel:
         
         return optimizable_tensors
 
-    
+    # 关键点：
+    #     位置保持：xyz_old 直接被用作新位置，即死亡高斯被移动到存活高斯的相同位置。
+    #     特征复制：颜色特征（features_dc 和 features_rest）也直接复制，确保视觉一致性。
+    #     不透明度和尺度调整：通过 compute_relocation_cuda 函数重新计算，避免直接复制导致的渲染问题。
     def _update_params(self, idxs, ratio):
+         # 通过CUDA核函数计算新的不透明度和尺度
         new_opacity, new_scaling = compute_relocation_cuda(
             opacity_old=self.get_opacity[idxs, 0],
             scale_old=self.get_scaling[idxs],
             N=ratio[idxs, 0] + 1
         )
+        # 应用激活函数，确保参数在合理范围
         new_opacity = torch.clamp(new_opacity.unsqueeze(-1), max=1.0 - torch.finfo(torch.float32).eps, min=0.005)
         new_opacity = self.inverse_opacity_activation(new_opacity)
         new_scaling = self.scaling_inverse_activation(new_scaling.reshape(-1, 3))
@@ -468,23 +482,30 @@ class GaussianModel:
         ratio = torch.bincount(sampled_idxs).unsqueeze(-1)
         return sampled_idxs, ratio
     
-
+    # 作用：
+    # 将 “死亡高斯”（不透明度低于阈值，如 0.005）移动到 “存活高斯”（高不透明度）附近，并重置其参数。这实现了论文中 “高斯重生” 的思想，避免了传统分裂 / 克隆操作的不稳定性。
+    # 核心机制：
+    # 基于不透明度的采样：从高不透明度的高斯中按概率采样，更可能选择对渲染贡献大的区域。
+    # 参数继承与调整：新高斯继承采样点的特征，但调整不透明度和尺度，确保渲染效果的连续性。
     def relocate_gs(self, dead_mask=None):
 
         if dead_mask.sum() == 0:
             return
-
+            
+        # 将死亡高斯（低不透明度）重定位到存活高斯附近
         alive_mask = ~dead_mask 
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
         alive_indices = alive_mask.nonzero(as_tuple=True)[0]
 
         if alive_indices.shape[0] <= 0:
             return
-
+        
         # sample from alive ones based on opacity
+        # 根据不透明度概率采样存活高斯
         probs = (self.get_opacity[alive_indices, 0]) 
         reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
-
+        
+        # 用存活高斯的参数更新死亡高斯，并调整不透明度和尺度
         (
             self._xyz[dead_indices], 
             self._features_dc[dead_indices],
@@ -497,20 +518,23 @@ class GaussianModel:
         self._opacity[reinit_idx] = self._opacity[dead_indices]
         self._scaling[reinit_idx] = self._scaling[dead_indices]
 
+         # 重置优化器统计
         self.replace_tensors_to_optimizer(inds=reinit_idx) 
         
 
     def add_new_gs(self, cap_max):
+        # 逐步增加存活高斯的数量，直到达到上限
         current_num_points = self._opacity.shape[0]
         target_num = min(cap_max, int(1.05 * current_num_points))
         num_gs = max(0, target_num - current_num_points)
 
         if num_gs <= 0:
             return 0
-
+            
+        # 基于不透明度采样现有高斯
         probs = self.get_opacity.squeeze(-1) 
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
-
+        
         (
             new_xyz, 
             new_features_dc,
@@ -519,11 +543,12 @@ class GaussianModel:
             new_scaling,
             new_rotation 
         ) = self._update_params(add_idx, ratio=ratio)
-
+        # 创建新高斯并添加到模型
         self._opacity[add_idx] = new_opacity
         self._scaling[add_idx] = new_scaling
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, reset_params=False)
+        # 重置优化器统计
         self.replace_tensors_to_optimizer(inds=add_idx)
 
         return num_gs
