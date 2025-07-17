@@ -23,7 +23,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from scene.gaussian_model import build_scaling_rotation
+from scene.gaussian_model import build_scaling_rotation ##
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -45,7 +45,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
+    
+    # 无l1 loss
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -72,12 +73,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
+        # 原gaussians.update_learning_rate(iteration)
         xyz_lr = gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
-
+        
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -99,6 +101,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
+        # 目的让高斯更加不透明、更加小
+        # 多了  args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+        # 多了  args.scale_reg * torch.abs(gaussians.get_scaling).mean()
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
         loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
@@ -121,6 +126,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            ## 没有densify_and_prune， 将不透明度最小的0.005高斯，用relocate_gs代替，并且+add_new_gs
+            ## 没有gaussians.reset_opacity()
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
                 gaussians.relocate_gs(dead_mask=dead_mask)
@@ -130,7 +137,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-
+                
+                ## 通过scal和rota,生成noise添加到高斯点上
                 L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
                 actual_covariance = L @ L.transpose(1, 2)
 
@@ -139,6 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1- gaussians.get_opacity))*args.noise_lr*xyz_lr
                 noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+                # 直接在原张量上进行修改
                 gaussians._xyz.add_(noise)
 
             if (iteration in checkpoint_iterations):
